@@ -13,10 +13,15 @@ from vision_socratique import traiter_document_gemini, generer_remediation_socra
 
 app = FastAPI(title="Care Online Science Correction API", version="1.0.0")
 
-# Setup CORS for development
+# Setup CORS for production and development
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "https://care-online.fr",
+        "https://www.care-online.fr",
+        "http://localhost:3000",
+        "http://127.0.0.1:3000"
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
