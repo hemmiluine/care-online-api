@@ -27,10 +27,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# API client initialization helper
-def get_gemini_client(api_key: str):
+# API client initialization helper — reads key from environment variable
+def get_gemini_client():
+    api_key = os.environ.get("GEMINI_API_KEY", "")
     if not api_key:
-        raise HTTPException(status_code=400, detail="Clé API Gemini (GEMINI_API_KEY) manquante.")
+        raise HTTPException(status_code=500, detail="Clé API Gemini introuvable. Veuillez définir la variable d'environnement GEMINI_API_KEY sur le serveur.")
     try:
         return genai.Client(api_key=api_key)
     except Exception as e:
@@ -38,7 +39,6 @@ def get_gemini_client(api_key: str):
 
 @app.post("/api/correct")
 async def correct_copy(
-    gemini_api_key: str = Form(...),
     model_name: str = Form("gemini-1.5-flash"),
     nom_eleve: Optional[str] = Form(None),
     sujet_file: Optional[UploadFile] = File(None),
@@ -47,8 +47,9 @@ async def correct_copy(
 ):
     """
     Reçoit le sujet, le barème et la copie de l'élève, appelle Gemini et compile la correction en PDF.
+    La clé API Gemini est lue depuis la variable d'environnement GEMINI_API_KEY.
     """
-    client = get_gemini_client(gemini_api_key)
+    client = get_gemini_client()
     
     # Déterminer le nom de l'élève à partir du fichier s'il n'est pas fourni
     if not nom_eleve:
@@ -140,7 +141,6 @@ async def correct_copy(
 
 @app.post("/api/generate-subject")
 async def generate_subject(
-    gemini_api_key: str = Form(...),
     model_name: str = Form("gemini-1.5-flash"),
     niveau: str = Form("seconde"),
     duree: str = Form("1 heure"),
@@ -153,8 +153,9 @@ async def generate_subject(
 ):
     """
     Génère un sujet d'examen ou TP au format LaTeX purifié et compile en PDF.
+    La clé API Gemini est lue depuis la variable d'environnement GEMINI_API_KEY.
     """
-    client = get_gemini_client(gemini_api_key)
+    client = get_gemini_client()
     
     consigne_difficulte = "ATTENTION MODE EXPERT : Le sujet doit être très dense et transversal." if difficulte == "Expert" else ("MODE APPROFONDI : Inclus un exercice d'extraction de données graphique." if difficulte == "Approfondi" else "MODE STANDARD : Exercices très guidés.")
     consignes_specifiques = []
