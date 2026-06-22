@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Depends
 from fastapi.responses import JSONResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from google import genai
@@ -6,10 +6,110 @@ import json
 import tempfile
 import os
 import re
-from typing import Optional
+from typing import Optional, List, Literal
+
+from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, text
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker, Session
+from datetime import datetime
+from pydantic import BaseModel
 
 from outils import purifier_latex_integral, compiler_en_pdf, indexer_bo_fichiers
 from vision_socratique import traiter_document_gemini, generer_remediation_socratique_pdf
+
+# SQLite / SQLAlchemy Setup
+DATABASE_URL = "sqlite:///./classes.db"
+engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
+
+class DBClass(Base):
+    __tablename__ = "classes"
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String, index=True, nullable=False)
+    description = Column(String, nullable=True)
+    students_count = Column(Integer, default=0)
+    average_grade = Column(Float, nullable=True)
+    presence_rate = Column(Float, default=100.0)
+
+# ---------------------------------------------------------------------------
+# Resource Model
+# ---------------------------------------------------------------------------
+
+# Allowed enum values (enforced at the Pydantic level)
+SCHOOL_TYPES = Literal["college", "lycee", "lycee_pro"]
+RESOURCE_TYPES = Literal["pdf", "html_custom", "streamlit_app", "link"]
+SUBJECT_TYPES = Literal["Mathematiques", "Sciences Physiques", "SNT"]
+
+class DBResource(Base):
+    """Collaborative resource shared between authenticated teachers."""
+    __tablename__ = "resources"
+
+    id = Column(Integer, primary_key=True, index=True)
+    title = Column(String, nullable=False, index=True)
+    school_type = Column(String, nullable=False)   # college | lycee | lycee_pro
+    grade_level = Column(String, nullable=False)   # 6eme | 5eme | seconde | terminale …
+    resource_type = Column(String, nullable=False) # pdf | html_custom | streamlit_app | link
+    subject = Column(String, nullable=False, default="Mathematiques")  # Mathematiques | Sciences Physiques | SNT
+    content_url = Column(String, nullable=False)
+    created_by = Column(String, nullable=False)    # email of the user who added the resource
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+# Create tables
+Base.metadata.create_all(bind=engine)
+
+# ---------------------------------------------------------------------------
+# Pydantic schemas — Classes
+# ---------------------------------------------------------------------------
+class ClassBase(BaseModel):
+    name: str
+    description: Optional[str] = None
+    students_count: int = 0
+    average_grade: Optional[float] = None
+    presence_rate: float = 100.0
+
+class ClassCreate(ClassBase):
+    pass
+
+class ClassUpdate(ClassBase):
+    pass
+
+class ClassResponse(ClassBase):
+    id: int
+    class Config:
+        from_attributes = True
+
+# ---------------------------------------------------------------------------
+# Pydantic schemas — Resources
+# ---------------------------------------------------------------------------
+class ResourceBase(BaseModel):
+    title: str
+    school_type: SCHOOL_TYPES
+    grade_level: str
+    resource_type: RESOURCE_TYPES
+    subject: SUBJECT_TYPES
+    content_url: str
+    created_by: str
+
+class ResourceCreate(ResourceBase):
+    pass
+
+class ResourceUpdate(ResourceBase):
+    pass
+
+class ResourceResponse(ResourceBase):
+    id: int
+    created_at: Optional[datetime] = None
+    class Config:
+        from_attributes = True
+
+# DB Dependency
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
 
 app = FastAPI(title="Care Online Science Correction API", version="1.0.0")
 
@@ -210,6 +310,137 @@ async def generate_subject(
             "success": False,
             "detail": f"Erreur de génération : {str(e)}"
         })
+
+# ---------------------------------------------------------------------------
+# CRUD Endpoints — Classes
+# ---------------------------------------------------------------------------
+@app.get("/api/classes", response_model=List[ClassResponse])
+@app.get("/api/classes/", response_model=List[ClassResponse])
+def read_classes(db: Session = Depends(get_db)):
+    return db.query(DBClass).all()
+
+@app.post("/api/classes", response_model=ClassResponse)
+@app.post("/api/classes/", response_model=ClassResponse)
+def create_class(class_data: ClassCreate, db: Session = Depends(get_db)):
+    db_class = DBClass(**class_data.dict())
+    db.add(db_class)
+    db.commit()
+    db.refresh(db_class)
+    return db_class
+
+@app.put("/api/classes/{class_id}", response_model=ClassResponse)
+def update_class(class_id: int, class_data: ClassUpdate, db: Session = Depends(get_db)):
+    db_class = db.query(DBClass).filter(DBClass.id == class_id).first()
+    if not db_class:
+        raise HTTPException(status_code=404, detail="Classe introuvable")
+    for key, value in class_data.dict().items():
+        setattr(db_class, key, value)
+    db.commit()
+    db.refresh(db_class)
+    return db_class
+
+@app.delete("/api/classes/{class_id}")
+def delete_class(class_id: int, db: Session = Depends(get_db)):
+    db_class = db.query(DBClass).filter(DBClass.id == class_id).first()
+    if not db_class:
+        raise HTTPException(status_code=404, detail="Classe introuvable")
+    db.delete(db_class)
+    db.commit()
+    return {"success": True, "detail": "Classe supprimée avec succès"}
+
+# ---------------------------------------------------------------------------
+# CRUD Endpoints — Resources (Hub de Ressources Collaboratif)
+# All endpoints are accessible to any authenticated user.
+# ---------------------------------------------------------------------------
+@app.get("/api/resources", response_model=List[ResourceResponse])
+@app.get("/api/resources/", response_model=List[ResourceResponse])
+def list_resources(
+    school_type: Optional[str] = None,
+    grade_level: Optional[str] = None,
+    resource_type: Optional[str] = None,
+    subject: Optional[str] = None,
+    db: Session = Depends(get_db)
+):
+    """
+    List all resources. Optional query parameters allow filtering by
+    school_type, grade_level, resource_type, or subject.
+    """
+    query = db.query(DBResource)
+    if school_type:
+        query = query.filter(DBResource.school_type == school_type)
+    if grade_level:
+        query = query.filter(DBResource.grade_level == grade_level)
+    if resource_type:
+        query = query.filter(DBResource.resource_type == resource_type)
+    if subject:
+        query = query.filter(DBResource.subject == subject)
+    return query.order_by(DBResource.created_at.desc()).all()
+
+@app.post("/api/resources", response_model=ResourceResponse, status_code=201)
+@app.post("/api/resources/", response_model=ResourceResponse, status_code=201)
+def create_resource(resource_data: ResourceCreate, db: Session = Depends(get_db)):
+    """Create a new resource in the collaborative hub."""
+    db_resource = DBResource(**resource_data.dict())
+    db.add(db_resource)
+    db.commit()
+    db.refresh(db_resource)
+    return db_resource
+
+@app.put("/api/resources/{resource_id}", response_model=ResourceResponse)
+def update_resource(
+    resource_id: int,
+    resource_data: ResourceUpdate,
+    db: Session = Depends(get_db)
+):
+    """Update an existing resource."""
+    db_resource = db.query(DBResource).filter(DBResource.id == resource_id).first()
+    if not db_resource:
+        raise HTTPException(status_code=404, detail="Ressource introuvable")
+    for key, value in resource_data.dict().items():
+        setattr(db_resource, key, value)
+    db.commit()
+    db.refresh(db_resource)
+    return db_resource
+
+@app.delete("/api/resources/{resource_id}")
+def delete_resource(resource_id: int, db: Session = Depends(get_db)):
+    """Delete a resource from the hub."""
+    db_resource = db.query(DBResource).filter(DBResource.id == resource_id).first()
+    if not db_resource:
+        raise HTTPException(status_code=404, detail="Ressource introuvable")
+    db.delete(db_resource)
+    db.commit()
+    return {"success": True, "detail": "Ressource supprimée avec succès"}
+
+@app.on_event("startup")
+def startup_populate_db():
+    # ---------------------------------------------------------------------------
+    # Safe schema migration: add 'subject' column if it doesn't exist yet.
+    # This handles the upgrade from the previous schema without data loss.
+    # ---------------------------------------------------------------------------
+    try:
+        with engine.connect() as conn:
+            conn.execute(text(
+                "ALTER TABLE resources ADD COLUMN subject VARCHAR NOT NULL DEFAULT 'Mathematiques'"
+            ))
+            conn.commit()
+    except Exception:
+        # Column already exists — nothing to do.
+        pass
+
+    db = SessionLocal()
+    try:
+        if db.query(DBClass).count() == 0:
+            mock_classes = [
+                DBClass(name="Terminale S1", description="Mathématiques Spécialité", students_count=28, average_grade=14.2, presence_rate=98.2),
+                DBClass(name="Seconde B", description="Mathématiques Générales", students_count=32, average_grade=12.8, presence_rate=95.5),
+                DBClass(name="Première A", description="Sciences de l'Ingénieur", students_count=18, average_grade=15.1, presence_rate=97.0),
+                DBClass(name="Terminale S2", description="Soutien Mathématiques", students_count=14, average_grade=11.5, presence_rate=94.8),
+            ]
+            db.bulk_save_objects(mock_classes)
+            db.commit()
+    finally:
+        db.close()
 
 if __name__ == "__main__":
     import uvicorn
