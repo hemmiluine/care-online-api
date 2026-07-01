@@ -17,9 +17,16 @@ from pydantic import BaseModel
 from outils import purifier_latex_integral, compiler_en_pdf, indexer_bo_fichiers
 from vision_socratique import traiter_document_gemini, generer_remediation_socratique_pdf
 
-# SQLite / SQLAlchemy Setup
-DATABASE_URL = "sqlite:///./classes.db"
-engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+# SQLite / SQLAlchemy / PostgreSQL Setup
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./sql_app.db")
+
+if DATABASE_URL.startswith("sqlite"):
+    engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+else:
+    if DATABASE_URL.startswith("postgres://"):
+        DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+    engine = create_engine(DATABASE_URL)
+
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
